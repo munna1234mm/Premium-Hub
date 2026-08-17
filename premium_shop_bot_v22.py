@@ -3192,9 +3192,10 @@ async def health_handler(request: web.Request):
 
 async def start_web_server():
     app = web.Application()
+    app.router.add_get("/", health_handler)
+    app.router.add_get("/health", health_handler)
     app.router.add_post("/ipn", ipn_handler)
     app.router.add_get("/invoice/{token}", pdf_handler)
-    app.router.add_get("/health", health_handler)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, WEB_HOST, WEB_PORT)
