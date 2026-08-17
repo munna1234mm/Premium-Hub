@@ -78,6 +78,9 @@ PUBLIC_CHANNEL_ID = os.getenv("PUBLIC_CHANNEL_ID", "").strip()
 PUBLIC_CHANNEL_URL = os.getenv("PUBLIC_CHANNEL_URL", "").strip()
 ADMIN_ALERT_CHANNEL_ID = os.getenv("ADMIN_ALERT_CHANNEL_ID", "").strip()
 GATEWAY_API_KEY = os.getenv("GATEWAY_API_KEY", os.getenv("API_KEY", "")).strip()
+DEPOSIT_WALLET_BSC = os.getenv("DEPOSIT_WALLET_BSC", os.getenv("DEPOSIT_WALLET_ADDRESS_BSC", os.getenv("DEPOSIT_WALLET_BEP20", ""))).strip()
+DEPOSIT_WALLET_POLYGON = os.getenv("DEPOSIT_WALLET_POLYGON", os.getenv("DEPOSIT_WALLET_ADDRESS_POLYGON", os.getenv("DEPOSIT_WALLET_MATIC", ""))).strip()
+DEPOSIT_WALLET_ETH = os.getenv("DEPOSIT_WALLET_ETH", os.getenv("DEPOSIT_WALLET_ADDRESS_ETH", os.getenv("DEPOSIT_WALLET_ERC20", ""))).strip()
 DEPOSIT_WALLET_ADDRESS = os.getenv("DEPOSIT_WALLET_ADDRESS", "").strip()
 GATEWAY_BASE_URL = "https://wallet-watch-api.lovable.app"
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
@@ -1034,8 +1037,16 @@ async def crypto_get_status() -> dict:
     return await crypto_gateway_api("GET", "/api/public/payments/status")
 
 
-async def get_gateway_deposit_address() -> str:
+async def get_gateway_deposit_address(chain: str = "") -> str:
     global CACHED_GATEWAY_WALLET
+    chain_clean = str(chain).lower().strip()
+    if chain_clean == "bsc" and DEPOSIT_WALLET_BSC:
+        return DEPOSIT_WALLET_BSC
+    elif chain_clean == "polygon" and DEPOSIT_WALLET_POLYGON:
+        return DEPOSIT_WALLET_POLYGON
+    elif (chain_clean == "ethereum" or chain_clean == "eth") and DEPOSIT_WALLET_ETH:
+        return DEPOSIT_WALLET_ETH
+
     if DEPOSIT_WALLET_ADDRESS:
         return DEPOSIT_WALLET_ADDRESS
     if CACHED_GATEWAY_WALLET:
@@ -1059,7 +1070,7 @@ async def crypto_verify_payment(tx_hash: str, chain: str, expected_amount: str, 
         "minConfirmations": 1,
         "notify": notify,
     }
-    addr = await get_gateway_deposit_address()
+    addr = await get_gateway_deposit_address(chain)
     if addr:
         body["walletAddress"] = addr
     return await crypto_gateway_api("POST", "/api/public/payments/verify", json=body)
@@ -1069,7 +1080,7 @@ async def crypto_get_deposits(chain: str | None = None, limit: int = 25) -> dict
     params = {"limit": str(limit)}
     if chain:
         params["chain"] = chain
-    addr = await get_gateway_deposit_address()
+    addr = await get_gateway_deposit_address(chain or "")
     if addr:
         params["address"] = addr
     return await crypto_gateway_api("GET", "/api/public/payments/deposits", params=params)
@@ -1892,13 +1903,13 @@ async def pickchain(callback: CallbackQuery, state: FSMContext):
     amount = Decimal(str(amount_raw))
 
     try:
-        deposit_addr = await get_gateway_deposit_address()
+        deposit_addr = await get_gateway_deposit_address(chain)
     except Exception:
         logging.exception("Could not get deposit address")
         deposit_addr = ""
 
     if not deposit_addr:
-        return await callback.answer("⚠️ Deposit address is not set. Please add DEPOSIT_WALLET_ADDRESS in Render Environment Variables.", show_alert=True)
+        return await callback.answer(f"⚠️ Deposit address for {chain.upper()} is not set. Please add DEPOSIT_WALLET_{chain.upper()} in Render Environment Variables.", show_alert=True)
 
     invoice_id = f"INV-{uuid4().hex[:10].upper()}"
     save_crypto_invoice(invoice_id, callback.from_user.id, kind, ref, amount, INVOICE_CURRENCY, chain, deposit_addr)
