@@ -1011,6 +1011,8 @@ async def crypto_gateway_api(method: str, path: str, **kwargs):
         "x-api-key": GATEWAY_API_KEY,
         "Authorization": f"Bearer {GATEWAY_API_KEY}",
         "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json",
     })
     timeout = aiohttp.ClientTimeout(total=25)
     async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -1041,7 +1043,7 @@ async def get_gateway_deposit_address() -> str:
     try:
         data = await crypto_get_status()
         addr = str(data.get("walletAddress") or "").strip()
-        if addr:
+        if addr and addr.lower() != "none" and addr.lower() != "null":
             CACHED_GATEWAY_WALLET = addr
             return addr
     except Exception as e:
@@ -1896,7 +1898,7 @@ async def pickchain(callback: CallbackQuery, state: FSMContext):
         deposit_addr = ""
 
     if not deposit_addr:
-        return await callback.answer(tr(callback.from_user.id, "payment_inactive"), show_alert=True)
+        return await callback.answer("⚠️ Deposit address is not set. Please add DEPOSIT_WALLET_ADDRESS in Render Environment Variables.", show_alert=True)
 
     invoice_id = f"INV-{uuid4().hex[:10].upper()}"
     save_crypto_invoice(invoice_id, callback.from_user.id, kind, ref, amount, INVOICE_CURRENCY, chain, deposit_addr)
