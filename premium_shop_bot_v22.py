@@ -44,6 +44,8 @@ from pathlib import Path
 from uuid import uuid4
 
 import aiohttp
+import firebase_admin
+from firebase_admin import credentials, db as rtdb
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.types import BotCommand, BotCommandScopeDefault, BotCommandScopeChat
@@ -86,6 +88,8 @@ SMTP_USER = os.getenv("SMTP_USER", "").strip()
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "").strip()
 SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USER).strip()
 DB_PATH = os.getenv("DB_PATH", "data/premium_shop.db").strip()
+FIREBASE_DATABASE_URL = os.getenv("FIREBASE_DATABASE_URL", "https://premium-hub-4e23d-default-rtdb.firebaseio.com").strip()
+FIREBASE_CREDENTIALS = os.getenv("FIREBASE_CREDENTIALS", "firebase_service_account.json").strip()
 WEB_HOST = os.getenv("WEB_HOST", "0.0.0.0").strip()
 WEB_PORT = int(os.getenv("PORT", os.getenv("WEB_PORT", "8080")) or 8080)
 PRODUCTS_PER_PAGE = 8
@@ -100,6 +104,67 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 router = Router()
 EMAIL_RE = re.compile(r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$")
 TX_HASH_RE = re.compile(r"^0x[a-fA-F0-9]{64}$")
+
+
+# =========================
+# FIREBASE REALTIME DB
+# =========================
+
+def init_firebase() -> bool:
+    try:
+        if firebase_admin._apps:
+            return True
+        cred = None
+        if FIREBASE_CREDENTIALS.startswith("{"):
+            cred_dict = json.loads(FIREBASE_CREDENTIALS)
+            cred = credentials.Certificate(cred_dict)
+        elif os.path.exists(FIREBASE_CREDENTIALS):
+            cred = credentials.Certificate(FIREBASE_CREDENTIALS)
+        elif os.path.exists("firebase_service_account.json"):
+            cred = credentials.Certificate("firebase_service_account.json")
+        
+        if cred:
+            firebase_admin.initialize_app(cred, {
+                "databaseURL": FIREBASE_DATABASE_URL
+            })
+            logging.info("Firebase Realtime Database connected (%s)", FIREBASE_DATABASE_URL)
+            return True
+        return False
+    except Exception as e:
+        logging.warning("Firebase init warning: %s", e)
+        return False
+
+
+def fb_set(path: str, data):
+    try:
+        if firebase_admin._apps:
+            rtdb.reference(path).set(data)
+    except Exception as e:
+        logging.debug("Firebase write error for %s: %s", path, e)
+
+
+def fb_update(path: str, data: dict):
+    try:
+        if firebase_admin._apps:
+            rtdb.reference(path).update(data)
+    except Exception as e:
+        logging.debug("Firebase update error for %s: %s", path, e)
+
+
+def fb_delete(path: str):
+    try:
+        if firebase_admin._apps:
+            rtdb.reference(path).delete()
+    except Exception as e:
+        logging.debug("Firebase delete error for %s: %s", path, e)
+
+
+def fb_get(path: str):
+    try:
+        if firebase_admin._apps:
+            return rtdb.reference(path).get()
+    except Exception:
+        return None
 
 
 # =========================
@@ -305,6 +370,104 @@ def init_db() -> None:
         con.commit()
 
 
+def sync_firebase_to_sqlite():
+    if not firebase_admin._apps:
+        return
+    try:
+        # Sync app settings
+        fb_settings = fb_get("app_settings") or {}
+        with db() as con:
+            for k, v in fb_settings.items():
+                con.execute("INSERT INTO app_settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(k), str(v)))
+            
+            # Sync products
+            fb_products = fb_get("products") or {}
+            for pid_str, p in fb_products.items():
+                if not isinstance(p, dict): continue
+                con.execute(
+                    """
+                    INSERT INTO products(id, name, price, warranty, note, active, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        name=excluded.name,
+                        price=excluded.price,
+                        warranty=excluded.warranty,
+                        note=excluded.note,
+                        active=excluded.active
+                    """,
+                    (int(p.get("id", pid_str)), p.get("name", ""), str(p.get("price", "0")), p.get("warranty", "No Warranty"), p.get("note", ""), int(p.get("active", 1)), p.get("created_at", datetime.now(timezone.utc).isoformat())),
+                )
+
+            # Sync stock items
+            fb_stock = fb_get("stock_items") or {}
+            for sid_str, s in fb_stock.items():
+                if not isinstance(s, dict): continue
+                con.execute(
+                    """
+                    INSERT INTO stock_items(id, product_id, content, status, order_id, created_at, sold_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        status=excluded.status,
+                        order_id=excluded.order_id,
+                        sold_at=excluded.sold_at
+                    """,
+                    (int(s.get("id", sid_str)), int(s.get("product_id")), s.get("content", ""), s.get("status", "AVAILABLE"), s.get("order_id"), s.get("created_at", datetime.now(timezone.utc).isoformat()), s.get("sold_at")),
+                )
+
+            # Sync users
+            fb_users = fb_get("users") or {}
+            for uid_str, u in fb_users.items():
+                if not isinstance(u, dict): continue
+                con.execute(
+                    """
+                    INSERT INTO users(telegram_id, username, full_name, email, wallet, language, blocked, region, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(telegram_id) DO UPDATE SET
+                        username=excluded.username,
+                        full_name=excluded.full_name,
+                        email=excluded.email,
+                        wallet=excluded.wallet,
+                        language=excluded.language,
+                        blocked=excluded.blocked,
+                        region=excluded.region
+                    """,
+                    (int(u.get("telegram_id", uid_str)), u.get("username"), u.get("full_name", ""), u.get("email"), str(u.get("wallet", "0")), u.get("language", "en"), int(u.get("blocked", 0)), u.get("region"), u.get("created_at", datetime.now(timezone.utc).isoformat())),
+                )
+
+            # Sync orders
+            fb_orders = fb_get("orders") or {}
+            for oid, o in fb_orders.items():
+                if not isinstance(o, dict): continue
+                con.execute(
+                    """
+                    INSERT INTO orders(order_id, telegram_id, product_id, product_name, quantity, unit_price, total_amount, payment_method, status, delivered_content, invoice_pdf_token, created_at, paid_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(order_id) DO UPDATE SET
+                        payment_method=excluded.payment_method,
+                        status=excluded.status,
+                        delivered_content=excluded.delivered_content,
+                        paid_at=excluded.paid_at
+                    """,
+                    (oid, int(o.get("telegram_id")), int(o.get("product_id")), o.get("product_name", ""), int(o.get("quantity", 1)), str(o.get("unit_price", "0")), str(o.get("total_amount", "0")), o.get("payment_method"), o.get("status", "PENDING"), o.get("delivered_content"), o.get("invoice_pdf_token"), o.get("created_at", datetime.now(timezone.utc).isoformat()), o.get("paid_at")),
+                )
+
+            # Sync processed transactions
+            fb_tx = fb_get("processed_transactions") or {}
+            for tx_hash, t in fb_tx.items():
+                if not isinstance(t, dict): continue
+                con.execute(
+                    """
+                    INSERT OR IGNORE INTO processed_transactions(tx_hash, invoice_id, chain, amount, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (tx_hash, t.get("invoice_id"), t.get("chain"), str(t.get("amount", "0")), t.get("created_at", datetime.now(timezone.utc).isoformat())),
+                )
+
+            con.commit()
+            logging.info("Synced data from Firebase Realtime Database to local memory.")
+    except Exception as e:
+        logging.warning("Firebase startup sync error: %s", e)
+
 
 def get_app_setting(key: str, default: str = "") -> str:
     with db() as con:
@@ -320,6 +483,7 @@ def set_app_setting(key: str, value: str) -> None:
             (key, str(value)),
         )
         con.commit()
+    fb_set(f"app_settings/{key}", str(value))
 
 
 def maintenance_enabled() -> bool:
@@ -372,6 +536,12 @@ def register_user(user) -> None:
             (user.id, user.username, user.full_name),
         )
         con.commit()
+    fb_update(f"users/{user.id}", {
+        "telegram_id": user.id,
+        "username": user.username or "",
+        "full_name": user.full_name,
+        "blocked": 0,
+    })
 
 
 def get_user(uid: int):
@@ -383,18 +553,21 @@ def set_email(uid: int, email: str | None):
     with db() as con:
         con.execute("UPDATE users SET email=? WHERE telegram_id=?", (email, uid))
         con.commit()
+    fb_update(f"users/{uid}", {"email": email or ""})
 
 
 def set_region(uid: int, region: str | None):
     with db() as con:
         con.execute("UPDATE users SET region=? WHERE telegram_id=?", (region, uid))
         con.commit()
+    fb_update(f"users/{uid}", {"region": region or ""})
 
 
 def set_language(uid: int, language: str):
     with db() as con:
         con.execute("UPDATE users SET language=? WHERE telegram_id=?", (language, uid))
         con.commit()
+    fb_update(f"users/{uid}", {"language": language})
 
 
 def user_orders(uid: int, limit: int = 15):
@@ -426,10 +599,17 @@ def stock_count(pid: int) -> int:
 def add_stock(pid: int, items: list[str]) -> int:
     clean = [x.strip() for x in items if x.strip()]
     with db() as con:
-        con.executemany(
-            "INSERT INTO stock_items(product_id, content) VALUES (?,?)",
-            [(pid, x) for x in clean],
-        )
+        cur = con.cursor()
+        for x in clean:
+            cur.execute("INSERT INTO stock_items(product_id, content) VALUES (?,?)", (pid, x))
+            sid = cur.lastrowid
+            fb_set(f"stock_items/{sid}", {
+                "id": sid,
+                "product_id": pid,
+                "content": x,
+                "status": "AVAILABLE",
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            })
         con.execute("DELETE FROM stock_alerts WHERE product_id=?", (pid,))
         con.commit()
     return len(clean)
@@ -442,13 +622,24 @@ def create_product(name: str, price: Decimal, warranty: str, note: str) -> int:
             (name, str(price), warranty, note),
         )
         con.commit()
-        return int(cur.lastrowid)
+        pid = int(cur.lastrowid)
+    fb_set(f"products/{pid}", {
+        "id": pid,
+        "name": name,
+        "price": str(price),
+        "warranty": warranty,
+        "note": note,
+        "active": 1,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
+    return pid
 
 
 def update_product_price(pid: int, new_price: Decimal) -> None:
     with db() as con:
         con.execute("UPDATE products SET price=? WHERE id=? AND active=1", (str(new_price), pid))
         con.commit()
+    fb_update(f"products/{pid}", {"price": str(new_price)})
 
 
 def update_product_field(pid: int, field: str, value: str) -> None:
@@ -458,6 +649,7 @@ def update_product_field(pid: int, field: str, value: str) -> None:
     with db() as con:
         con.execute(f"UPDATE products SET {field}=? WHERE id=? AND active=1", (value, pid))
         con.commit()
+    fb_update(f"products/{pid}", {field: value})
 
 
 def soft_delete_product(pid: int) -> int:
@@ -471,7 +663,8 @@ def soft_delete_product(pid: int) -> int:
         con.execute("DELETE FROM stock_alerts WHERE product_id=?", (pid,))
         con.execute("UPDATE products SET active=0 WHERE id=?", (pid,))
         con.commit()
-        return int(count)
+    fb_update(f"products/{pid}", {"active": 0})
+    return int(count)
 
 
 def delete_available_stock(pid: int, amount: int | None = None) -> int:
@@ -493,7 +686,9 @@ def delete_available_stock(pid: int, amount: int | None = None) -> int:
         con.execute(f"DELETE FROM stock_items WHERE id IN ({marks})", ids)
         con.execute("DELETE FROM stock_alerts WHERE product_id=?", (pid,))
         con.commit()
-        return len(ids)
+    for sid in ids:
+        fb_delete(f"stock_items/{sid}")
+    return len(ids)
 
 
 
@@ -524,7 +719,9 @@ def delete_stock_item_by_id(pid: int, stock_item_id: int) -> bool:
         if cur.rowcount:
             con.execute("DELETE FROM stock_alerts WHERE product_id=?", (pid,))
         con.commit()
-        return bool(cur.rowcount)
+    if cur.rowcount:
+        fb_delete(f"stock_items/{stock_item_id}")
+    return bool(cur.rowcount)
 
 
 def create_order(uid: int, product, qty: int) -> str:
@@ -542,6 +739,18 @@ def create_order(uid: int, product, qty: int) -> str:
             (oid, uid, product["id"], product["name"], qty, product["price"], str(total), token),
         )
         con.commit()
+    fb_set(f"orders/{oid}", {
+        "order_id": oid,
+        "telegram_id": uid,
+        "product_id": product["id"],
+        "product_name": product["name"],
+        "quantity": qty,
+        "unit_price": str(product["price"]),
+        "total_amount": str(total),
+        "status": "PENDING_PAYMENT",
+        "invoice_pdf_token": token,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
     return oid
 
 
@@ -559,6 +768,7 @@ def update_order(oid: str, **fields):
     with db() as con:
         con.execute(f"UPDATE orders SET {sql} WHERE order_id=?", (*clean.values(), oid))
         con.commit()
+    fb_update(f"orders/{oid}", clean)
 
 
 def change_wallet(uid: int, amount: Decimal, tx_type: str, ref: str, note: str = "") -> Decimal:
@@ -574,16 +784,29 @@ def change_wallet(uid: int, amount: Decimal, tx_type: str, ref: str, note: str =
             con.rollback()
             raise ValueError("Insufficient balance")
         con.execute("UPDATE users SET wallet=? WHERE telegram_id=?", (str(after), uid))
+        tx_id = f"TX-{uuid4().hex[:14].upper()}"
         con.execute(
             """
             INSERT INTO wallet_transactions(
                 tx_id, telegram_id, type, amount, balance_before, balance_after, reference_id, note
             ) VALUES (?,?,?,?,?,?,?,?)
             """,
-            (f"TX-{uuid4().hex[:14].upper()}", uid, tx_type, str(amount), str(before), str(after), ref, note),
+            (tx_id, uid, tx_type, str(amount), str(before), str(after), ref, note),
         )
         con.commit()
-        return after
+    fb_update(f"users/{uid}", {"wallet": str(after)})
+    fb_set(f"wallet_transactions/{tx_id}", {
+        "tx_id": tx_id,
+        "telegram_id": uid,
+        "type": tx_type,
+        "amount": str(amount),
+        "balance_before": str(before),
+        "balance_after": str(after),
+        "reference_id": ref,
+        "note": note,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
+    return after
 
 
 def take_stock(pid: int, qty: int, oid: str) -> list[str]:
@@ -603,7 +826,13 @@ def take_stock(pid: int, qty: int, oid: str) -> list[str]:
             (oid, *ids),
         )
         con.commit()
-        return [r["content"] for r in rows]
+    for sid in ids:
+        fb_update(f"stock_items/{sid}", {
+            "status": "SOLD",
+            "order_id": oid,
+            "sold_at": datetime.now(timezone.utc).isoformat(),
+        })
+    return [r["content"] for r in rows]
 
 
 SUPPORTED_CHAINS = {
@@ -647,6 +876,18 @@ def save_crypto_invoice(invoice_id: str, uid: int, kind: str, ref: str, amount, 
             (invoice_id, uid, kind, ref, str(amount), currency, chain, deposit_address),
         )
         con.commit()
+    fb_set(f"payment_invoices/{invoice_id}", {
+        "invoice_id": invoice_id,
+        "telegram_id": uid,
+        "payment_kind": kind,
+        "reference_id": ref,
+        "invoice_amount": str(amount),
+        "invoice_currency": currency,
+        "chain": chain,
+        "deposit_address": deposit_address,
+        "status": "PENDING",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
 
 
 def get_saved_invoice(invoice_id: str):
@@ -675,6 +916,13 @@ def record_processed_tx(tx_hash: str, invoice_id: str, chain: str, amount: str):
             (clean_tx, invoice_id, chain, str(amount)),
         )
         con.commit()
+    fb_set(f"processed_transactions/{clean_tx}", {
+        "tx_hash": clean_tx,
+        "invoice_id": invoice_id,
+        "chain": chain,
+        "amount": str(amount),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
 
 
 def mark_webhook_processed(invoice_id: str, tx_hash: str) -> bool:
@@ -2844,6 +3092,8 @@ async def setup_shop_commands(bot: Bot):
 async def main():
     global BOT_INSTANCE
     init_db()
+    init_firebase()
+    sync_firebase_to_sqlite()
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     await setup_shop_commands(bot)
     BOT_INSTANCE = bot
@@ -2864,3 +3114,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("Bot stopped.")
+
