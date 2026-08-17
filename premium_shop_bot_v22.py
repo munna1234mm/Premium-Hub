@@ -231,6 +231,11 @@ class PaymentVerifyState(StatesGroup):
     waiting_tx = State()
 
 
+class AdminChannelState(StatesGroup):
+    url = State()
+    channel_id = State()
+
+
 # =========================
 # DATABASE
 # =========================
@@ -1231,8 +1236,17 @@ def is_admin(uid: int) -> bool:
     return ADMIN_ID and uid == ADMIN_ID
 
 
+def get_public_channel_url() -> str:
+    return get_app_setting("public_channel_url", PUBLIC_CHANNEL_URL).strip()
+
+
+def get_public_channel_id() -> str:
+    return get_app_setting("public_channel_id", PUBLIC_CHANNEL_ID).strip()
+
+
 def main_kb(uid=None):
-    channel_button = InlineKeyboardButton(text=tr(uid,"channel"), url=PUBLIC_CHANNEL_URL, style="success") if PUBLIC_CHANNEL_URL else InlineKeyboardButton(text=tr(uid,"channel"), callback_data="menu:channel", style="success")
+    chan_url = get_public_channel_url()
+    channel_button = InlineKeyboardButton(text=tr(uid,"channel"), url=chan_url, style="success") if chan_url else InlineKeyboardButton(text=tr(uid,"channel"), callback_data="menu:channel", style="success")
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=tr(uid,"shop"),callback_data="menu:products",style="success")],[InlineKeyboardButton(text=tr(uid,"topup"),callback_data="menu:topup",style="primary"),InlineKeyboardButton(text=tr(uid,"settings"),callback_data="menu:settings",style="success")],[InlineKeyboardButton(text=tr(uid,"support"),callback_data="menu:support",style="primary"),channel_button]])
 
 
@@ -1368,12 +1382,15 @@ def admin_kb():
             InlineKeyboardButton(text="📦 Products", callback_data="admin:products", style="primary"),
         ],
         [
+            InlineKeyboardButton(text="📢 Channel Settings", callback_data="admin:channel_settings", style="primary"),
+            InlineKeyboardButton(text="☁️ Cloud Backup", callback_data="admin:cloud_menu", style="primary"),
+        ],
+        [
             InlineKeyboardButton(
                 text=("🛠 Maintenance: ON" if maintenance_enabled() else "🛠 Maintenance: OFF"),
                 callback_data="admin:maintenance",
                 style=("danger" if maintenance_enabled() else "success"),
-            ),
-            InlineKeyboardButton(text="☁️ Cloud Backup", callback_data="admin:cloud_menu", style="primary"),
+            )
         ],
         [InlineKeyboardButton(text="◀ Back to Customer", callback_data="menu:home", style="danger")],
     ])
@@ -1433,8 +1450,9 @@ async def broadcast_new_product(bot: Bot, pid: int):
     user_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🛒 Buy Now", callback_data=f"product:{pid}:1", style="danger")]])
     public_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🛒 Buy Now", url=f"https://t.me/{me.username}?start=product_{pid}", style="success")]])
 
-    if PUBLIC_CHANNEL_ID:
-        await safe_send(bot, PUBLIC_CHANNEL_ID, text, public_kb)
+    chan_id = get_public_channel_id()
+    if chan_id:
+        await safe_send(bot, chan_id, text, public_kb)
 
     with db() as con:
         users = con.execute("SELECT telegram_id FROM users WHERE blocked=0").fetchall()
@@ -1476,8 +1494,9 @@ async def broadcast_stock_added(bot: Bot, pid: int, added: int):
         )]]
     )
 
-    if PUBLIC_CHANNEL_ID:
-        await safe_send(bot, PUBLIC_CHANNEL_ID, text, public_kb)
+    chan_id = get_public_channel_id()
+    if chan_id:
+        await safe_send(bot, chan_id, text, public_kb)
 
     with db() as con:
         users = con.execute("SELECT telegram_id FROM users WHERE blocked=0").fetchall()
@@ -1492,7 +1511,8 @@ async def broadcast_stock_added(bot: Bot, pid: int, added: int):
 
 
 async def public_purchase_notice(bot: Bot, order):
-    if not PUBLIC_CHANNEL_ID:
+    chan_id = get_public_channel_id()
+    if not chan_id:
         return
     text = (
         "✅ <b>NEW ORDER COMPLETED</b>\n\n"
@@ -1501,7 +1521,7 @@ async def public_purchase_notice(bot: Bot, order):
         f"💰 Total: <b>{money(order['total_amount'])} {INVOICE_CURRENCY}</b>\n"
         "⚡ Delivered automatically."
     )
-    await safe_send(bot, PUBLIC_CHANNEL_ID, text)
+    await safe_send(bot, chan_id, text)
 
 
 # =========================
@@ -2216,7 +2236,121 @@ async def email_delete(callback: CallbackQuery):
 
 @router.callback_query(F.data == "menu:channel")
 async def channel_not_set(callback: CallbackQuery):
-    await callback.answer(tr(callback.from_user.id,"channel_missing"), show_alert=True)
+    c_url = get_public_channel_url()
+    if c_url:
+        return await edit(
+            callback,
+            f"📢 <b>Join Our Official Channel</b>\n\nStay updated with new stock and special offers:\n{html.escape(c_url)}",
+            InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📢 Open Channel", url=c_url, style="success")],
+                [InlineKeyboardButton(text="◀ Back", callback_data="menu:home", style="danger")],
+            ]),
+        )
+    if is_admin(callback.from_user.id):
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📢 Configure Channel Link", callback_data="admin:channel_set_url", style="success")],
+            [InlineKeyboardButton(text="◀ Back", callback_data="menu:home", style="danger")],
+        ])
+        return await edit(callback, "📢 <b>Public Channel is not configured yet.</b>\n\nAs the Admin, you can set your channel link now:", kb)
+    await callback.answer(tr(callback.from_user.id, "channel_missing"), show_alert=True)
+
+
+@router.callback_query(F.data == "admin:channel_settings")
+async def admin_channel_settings(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    await state.clear()
+    c_url = get_public_channel_url() or "Not Set"
+    c_id = get_public_channel_id() or "Not Set"
+    
+    text = (
+        "📢 <b>Public Channel Settings</b>\n\n"
+        f"🔗 <b>Channel Link / URL:</b> <code>{html.escape(c_url)}</code>\n"
+        f"🆔 <b>Channel Telegram ID:</b> <code>{html.escape(c_id)}</code>\n\n"
+        "• <b>Channel Link</b>: কাস্টমার যখন '📢 Channel' বাটনে চাপবে, সরাসরি এই লিংকে চলে যাবে।\n"
+        "• <b>Channel ID</b>: নতুন প্রোডাক্ট বা কেনাকাটার নোটিফিকেশন এই চ্যানেলে অটো পোস্ট হবে (বটকে চ্যানেলে Admin বানাতে হবে)।"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔗 Set Channel Link (URL)", callback_data="admin:channel_set_url", style="success")],
+        [InlineKeyboardButton(text="🆔 Set Channel Numeric ID", callback_data="admin:channel_set_id", style="primary")],
+        [InlineKeyboardButton(text="🗑 Clear Channel Link", callback_data="admin:channel_clear", style="danger")],
+        [InlineKeyboardButton(text="◀ Back to Admin", callback_data="admin:home", style="danger")],
+    ])
+    await edit(callback, text, kb)
+
+
+@router.callback_query(F.data == "admin:channel_set_url")
+async def admin_channel_set_url(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    await state.set_state(AdminChannelState.url)
+    await edit(
+        callback,
+        "📢 <b>Set Public Channel Link</b>\n\n"
+        "আপনার টেলিগ্রাম চ্যানেলের লিংক পাঠান:\n"
+        "উদাহরণ: <code>https://t.me/YourChannel</code> অথবা <code>@YourChannel</code>",
+        InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀ Cancel", callback_data="admin:channel_settings", style="danger")]]),
+    )
+
+
+@router.message(AdminChannelState.url)
+async def admin_channel_url_received(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    raw = (message.text or "").strip()
+    if not raw.startswith("http") and not raw.startswith("@") and not raw.startswith("t.me"):
+        return await message.answer("❌ Please send a valid channel link (e.g. <code>https://t.me/YourChannel</code> or <code>@YourChannel</code>).")
+    
+    if raw.startswith("@"):
+        url = f"https://t.me/{raw.lstrip('@')}"
+    elif raw.startswith("t.me"):
+        url = f"https://{raw}"
+    else:
+        url = raw
+    
+    set_app_setting("public_channel_url", url)
+    await state.clear()
+    await message.answer(
+        f"✅ <b>Public Channel Link Updated!</b>\n\n🔗 <code>{html.escape(url)}</code>\n\nএখন থেকে কাস্টমাররা '📢 Channel' বাটনে চাপলে সরাসরি আপনার চ্যানেলে চলে যাবে।",
+        reply_markup=admin_kb(),
+    )
+
+
+@router.callback_query(F.data == "admin:channel_set_id")
+async def admin_channel_set_id(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    await state.set_state(AdminChannelState.channel_id)
+    await edit(
+        callback,
+        "🆔 <b>Set Channel Numeric ID</b>\n\n"
+        "আপনার টেলিগ্রাম চ্যানেলের আইডি পাঠান (সাধারণত <code>-100...</code> দিয়ে শুরু হয়):\n"
+        "উদাহরণ: <code>-1001234567890</code>\n\n"
+        "<i>(নোট: চ্যানেলে অটোমেটিক নোটিফিকেশন পাঠানোর জন্য বটকে চ্যানেলে Admin বানাতে হবে)</i>",
+        InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀ Cancel", callback_data="admin:channel_settings", style="danger")]]),
+    )
+
+
+@router.message(AdminChannelState.channel_id)
+async def admin_channel_id_received(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    raw = (message.text or "").strip()
+    set_app_setting("public_channel_id", raw)
+    await state.clear()
+    await message.answer(
+        f"✅ <b>Public Channel ID Updated!</b>\n\n🆔 <code>{html.escape(raw)}</code>\n\nনতুন প্রোডাক্ট যোগ করলে বা অর্ডার সম্পন্ন হলে এই চ্যানেলে অটো পোস্ট হবে।",
+        reply_markup=admin_kb(),
+    )
+
+
+@router.callback_query(F.data == "admin:channel_clear")
+async def admin_channel_clear(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    set_app_setting("public_channel_url", "")
+    await callback.answer("Channel link cleared.", show_alert=True)
+    await admin_channel_settings(callback, state)
 
 
 @router.callback_query(F.data == "menu:support")
