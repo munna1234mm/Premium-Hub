@@ -469,6 +469,67 @@ def sync_firebase_to_sqlite():
         logging.warning("Firebase startup sync error: %s", e)
 
 
+def push_sqlite_to_firebase() -> dict:
+    """Takes a full snapshot of local database and pushes all records to Firebase Realtime Database."""
+    if not firebase_admin._apps:
+        return {"ok": False, "error": "Firebase not connected"}
+    counts = {"users": 0, "products": 0, "stock": 0, "orders": 0, "settings": 0}
+    try:
+        with db() as con:
+            # Users
+            users = con.execute("SELECT * FROM users").fetchall()
+            u_dict = {str(u["telegram_id"]): dict(u) for u in users}
+            if u_dict:
+                fb_update("users", u_dict)
+                counts["users"] = len(u_dict)
+
+            # Products
+            products = con.execute("SELECT * FROM products").fetchall()
+            p_dict = {str(p["id"]): dict(p) for p in products}
+            if p_dict:
+                fb_update("products", p_dict)
+                counts["products"] = len(p_dict)
+
+            # Stock items
+            stock = con.execute("SELECT * FROM stock_items").fetchall()
+            s_dict = {str(s["id"]): dict(s) for s in stock}
+            if s_dict:
+                fb_update("stock_items", s_dict)
+                counts["stock"] = len(s_dict)
+
+            # Orders
+            orders = con.execute("SELECT * FROM orders").fetchall()
+            o_dict = {str(o["order_id"]): dict(o) for o in orders}
+            if o_dict:
+                fb_update("orders", o_dict)
+                counts["orders"] = len(o_dict)
+
+            # App settings
+            settings = con.execute("SELECT * FROM app_settings").fetchall()
+            set_dict = {str(s["key"]): str(s["value"]) for s in settings}
+            if set_dict:
+                fb_update("app_settings", set_dict)
+                counts["settings"] = len(set_dict)
+
+        logging.info("Full database snapshot pushed to Firebase: %s", counts)
+        return {"ok": True, "counts": counts}
+    except Exception as e:
+        logging.error("Failed to push database to Firebase: %s", e)
+        return {"ok": False, "error": str(e)}
+
+
+async def auto_cloud_sync_loop():
+    """Background worker that periodically backs up the database to Firebase Cloud."""
+    while True:
+        try:
+            await asyncio.sleep(300)  # Every 5 minutes
+            push_sqlite_to_firebase()
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logging.debug("Auto cloud sync background error: %s", e)
+
+
 def get_app_setting(key: str, default: str = "") -> str:
     with db() as con:
         row = con.execute("SELECT value FROM app_settings WHERE key=?", (key,)).fetchone()
@@ -1298,7 +1359,8 @@ def admin_kb():
                 text=("🛠 Maintenance: ON" if maintenance_enabled() else "🛠 Maintenance: OFF"),
                 callback_data="admin:maintenance",
                 style=("danger" if maintenance_enabled() else "success"),
-            )
+            ),
+            InlineKeyboardButton(text="☁️ Cloud Backup", callback_data="admin:cloud_menu", style="primary"),
         ],
         [InlineKeyboardButton(text="◀ Back to Customer", callback_data="menu:home", style="danger")],
     ])
@@ -2237,6 +2299,109 @@ async def admin_maintenance_off(callback: CallbackQuery):
     await broadcast_maintenance(callback.bot, False)
 
 
+@router.message(Command("backup"))
+@router.callback_query(F.data == "admin:cloud_menu")
+async def admin_cloud_menu(event: Message | CallbackQuery):
+    uid = event.from_user.id
+    if not is_admin(uid):
+        return
+    is_connected = bool(firebase_admin._apps)
+    status_text = "🟢 Connected (Active)" if is_connected else "🔴 Disconnected (Check .env)"
+    
+    with db() as con:
+        user_c = con.execute("SELECT COUNT(*) c FROM users").fetchone()["c"]
+        prod_c = con.execute("SELECT COUNT(*) c FROM products WHERE active=1").fetchone()["c"]
+        order_c = con.execute("SELECT COUNT(*) c FROM orders").fetchone()["c"]
+        stock_c = con.execute("SELECT COUNT(*) c FROM stock_items WHERE status='AVAILABLE'").fetchone()["c"]
+    
+    text = (
+        "☁️ <b>Firebase Cloud Database Center</b>\n\n"
+        f"🌐 <b>Cloud Status:</b> <b>{status_text}</b>\n"
+        f"🔗 <b>Project:</b> <code>premium-hub-4e23d</code>\n\n"
+        "📊 <b>Local Memory Stats:</b>\n"
+        f"• 👥 Users: <b>{user_c}</b>\n"
+        f"• 🛍 Active Products: <b>{prod_c}</b>\n"
+        f"• 📦 Available Stock: <b>{stock_c}</b>\n"
+        f"• 📑 Orders: <b>{order_c}</b>\n\n"
+        "⚡ <b>Protection Features:</b>\n"
+        "• Render রিস্টার্ট নিলেও সব ইউজার ও প্রোডাক্ট সুরক্ষিত থাকে।\n"
+        "• প্রতি ৫ মিনিট অন্তর অটোমেটিক ব্যাকআপ ক্লাউডে জমা হয়।\n"
+        "• যেকোনো সময় নিচে বাটন চেপে ম্যানুয়াল ব্যাকআপ বা সিঙ্ক করতে পারবেন।"
+    )
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="☁️ Backup to Cloud Now", callback_data="admin:cloud_backup_now", style="success"),
+            InlineKeyboardButton(text="📥 Sync from Cloud Now", callback_data="admin:cloud_sync_now", style="primary"),
+        ],
+        [InlineKeyboardButton(text="◀ Back", callback_data="admin:home", style="danger")],
+    ])
+    
+    if isinstance(event, CallbackQuery):
+        await edit(event, text, kb)
+    else:
+        await event.answer(text, reply_markup=kb)
+
+
+@router.callback_query(F.data == "admin:cloud_backup_now")
+async def admin_cloud_backup_now(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    await callback.answer("⏳ Backing up to Firebase Cloud...", show_alert=False)
+    res = push_sqlite_to_firebase()
+    if res.get("ok"):
+        c = res.get("counts", {})
+        msg = (
+            "✅ <b>Cloud Backup Successful!</b>\n\n"
+            f"👥 Users backed up: <b>{c.get('users', 0)}</b>\n"
+            f"🛍 Products backed up: <b>{c.get('products', 0)}</b>\n"
+            f"📦 Stock items backed up: <b>{c.get('stock', 0)}</b>\n"
+            f"📑 Orders backed up: <b>{c.get('orders', 0)}</b>\n"
+            f"⚙️ Settings backed up: <b>{c.get('settings', 0)}</b>\n\n"
+            "🛡️ All data is safely stored in Firebase Realtime Database."
+        )
+    else:
+        msg = f"❌ <b>Backup Failed:</b> {html.escape(str(res.get('error')))}"
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀ Back to Cloud Menu", callback_data="admin:cloud_menu", style="primary")],
+    ])
+    await edit(callback, msg, kb)
+
+
+@router.message(Command("sync"))
+@router.callback_query(F.data == "admin:cloud_sync_now")
+async def admin_cloud_sync_now(event: Message | CallbackQuery):
+    uid = event.from_user.id
+    if not is_admin(uid):
+        return
+    if isinstance(event, CallbackQuery):
+        await event.answer("⏳ Restoring data from Firebase Cloud...", show_alert=False)
+    sync_firebase_to_sqlite()
+    
+    with db() as con:
+        user_c = con.execute("SELECT COUNT(*) c FROM users").fetchone()["c"]
+        prod_c = con.execute("SELECT COUNT(*) c FROM products WHERE active=1").fetchone()["c"]
+        stock_c = con.execute("SELECT COUNT(*) c FROM stock_items WHERE status='AVAILABLE'").fetchone()["c"]
+        order_c = con.execute("SELECT COUNT(*) c FROM orders").fetchone()["c"]
+    
+    msg = (
+        "✅ <b>Cloud Sync & Restore Complete!</b>\n\n"
+        f"👥 Restored Users: <b>{user_c}</b>\n"
+        f"🛍 Restored Products: <b>{prod_c}</b>\n"
+        f"📦 Restored Stock: <b>{stock_c}</b>\n"
+        f"📑 Restored Orders: <b>{order_c}</b>\n\n"
+        "✨ Local database is 100% updated from Firebase Cloud."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀ Back to Cloud Menu", callback_data="admin:cloud_menu", style="primary")],
+    ])
+    if isinstance(event, CallbackQuery):
+        await edit(event, msg, kb)
+    else:
+        await event.answer(msg, reply_markup=kb)
+
+
 @router.callback_query(F.data == "admin:add_product")
 async def admin_add_product(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id): return
@@ -3101,12 +3266,18 @@ async def main():
     dp.include_router(router)
     await bot.delete_webhook(drop_pending_updates=True)
     runner = await start_web_server()
-    logging.info("%s is running...", BOT_NAME)
+    sync_task = asyncio.create_task(auto_cloud_sync_loop())
+    logging.info("%s is running with Firebase Cloud Persistence active...", BOT_NAME)
     try:
         await dp.start_polling(bot)
     finally:
+        sync_task.cancel()
+        with suppress(Exception):
+            await sync_task
+        push_sqlite_to_firebase()
         await runner.cleanup()
         await bot.session.close()
+        logging.info("Bot stopped gracefully. Cloud snapshot saved.")
 
 
 if __name__ == "__main__":
